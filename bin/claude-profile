@@ -1,0 +1,387 @@
+#!/usr/bin/env bash
+# claude-profile: per-client Claude Code profiles. Each profile has its own CLAUDE_CONFIG_DIR,
+# login, org lock and working directories; `run` picks the profile from the current directory.
+set -euo pipefail
+
+VERSION="0.1.0"
+
+ROOT="${CLAUDE_PROFILES_ROOT:-$HOME/.claude-profiles}"
+CLAUDE_BIN="${CLAUDE_BIN:-claude}"
+
+die() { echo "claude-profile: $*" >&2; exit 1; }
+need() { command -v "$1" >/dev/null 2>&1 || die "$1 is required"; }
+abspath() { (cd "$1" 2>/dev/null && pwd -P) || die "directory not found: $1"; }
+pdir() { echo "$ROOT/$1"; }
+pjson() { echo "$ROOT/$1/profile.json"; }
+exists() { [[ -f "$(pjson "$1")" ]]; }
+aliases() { [[ -d "$ROOT" ]] || return 0; find "$ROOT" -mindepth 2 -maxdepth 2 -name profile.json | sed -E "s#^$ROOT/([^/]+)/profile.json#\1#" | sort; }
+
+usage() {
+  cat <<EOF
+Usage:
+  claude-profile add --client NAME --alias ALIAS [--email EMAIL] --dir PATH [--dir PATH...] [--mcp NAME...] [--no-login]
+  claude-profile login ALIAS          Sign in (opens a browser) and lock the profile to that org
+  claude-profile run [ALIAS] [-- claude args...]
+                                      No ALIAS: use the profile whose directories contain \$PWD;
+                                      prompts when several profiles share the directory
+  claude-profile match                Print the profiles covering \$PWD; exit 1 if none
+  claude-profile list
+  claude-profile add-dir ALIAS PATH   Add a directory to a profile
+  claude-profile mcp ALIAS [allow|deny NAME...]
+                                      Show or change which of your MCP servers the profile may use
+                                      (none by default; names as \`claude mcp list\` prints them)
+  claude-profile remove ALIAS         Log out and move the profile to \$CLAUDE_PROFILES_ROOT/.removed
+  claude-profile shell-init           Print shell functions; add  eval "\$(claude-profile shell-init)"  to ~/.zshrc
+  claude-profile version
+
+Environment:
+  CLAUDE_PROFILES_ROOT   where profiles live (default ~/.claude-profiles)
+  CLAUDE_BASE_CONFIG     default config shared into every profile (default ~/.claude)
+  CLAUDE_BIN             claude executable (default claude)
+  CLAUDE_PROFILE=none    make the shell's claude function skip profiles
+EOF
+}
+
+# Blocked paths for a profile: every other profile's folder and working directories,
+# except directories this profile also owns or that contain one of its directories.
+blocked_paths() {  # alias
+  local a="$1" others
+  others="$(for o in $(aliases); do [[ "$o" != "$a" ]] && jq -c '(.expanded // .dirs)[]' "$(pjson "$o")"; done | jq -s 'unique')"
+  local others_cfg
+  others_cfg="$(for o in $(aliases); do [[ "$o" != "$a" ]] && pdir "$o"; done | jq -R . | jq -s .)"
+  jq -r --argjson others "$others" --argjson ocfg "$others_cfg" '
+    (.expanded // .dirs) as $own
+    | $ocfg + [ $others[] | . as $d
+        | select(([$own[] | . == $d or startswith($d + "/")] | any) | not) ]
+    | unique[]' "$(pjson "$a")"
+}
+
+warn_ancestors() {  # alias: other profiles' dirs that contain this profile's dirs cannot be blocked
+  local a="$1" o
+  for o in $(aliases); do
+    [[ "$o" == "$a" ]] && continue
+    jq -r --slurpfile mine "$(pjson "$a")" '($mine[0].expanded // $mine[0].dirs) as $m | [(.expanded // .dirs)[] as $d | select(($m | index($d)) == null) | select(any($m[]; startswith($d + "/"))) | $d] | unique[]' "$(pjson "$o")" \
+      | while read -r d; do echo "warning: $a cannot block $o's $d because it contains $a's own directory" >&2; done
+  done
+}
+
+BASE="${CLAUDE_BASE_CONFIG:-$HOME/.claude}"
+SHARED_ITEMS="CLAUDE.md commands skills agents hooks output-styles plugins keybindings.json"
+# Each profile keeps its own copy of these, so notes saved in one client's session stay in that profile.
+PRIVATE_ITEMS="memory agent-memory"
+
+# MCP servers the default config provides: user-level servers from ~/.claude.json and every
+# installed plugin's servers, named as Claude Code names them (plugin:<plugin>:<server>).
+known_mcp() {
+  [[ -f "$HOME/.claude.json" ]] && jq -r '.mcpServers // {} | keys[]' "$HOME/.claude.json"
+  local idx="$BASE/plugins/installed_plugins.json" plugin path f ref
+  [[ -f "$idx" ]] || return 0
+  jq -r '.plugins // {} | to_entries[] | "\(.key | split("@")[0])\t\(.value[0].installPath // "")"' "$idx" \
+    | while IFS=$'\t' read -r plugin path; do
+        [[ -d "$path" ]] || continue
+        {
+          [[ -f "$path/.mcp.json" ]] && jq -r '(.mcpServers // .) | objects | keys[]' "$path/.mcp.json"
+          f="$path/.claude-plugin/plugin.json"
+          if [[ -f "$f" ]]; then
+            case "$(jq -r '.mcpServers | type' "$f")" in
+              object) jq -r '.mcpServers | keys[]' "$f" ;;
+              string) ref="$path/$(jq -r .mcpServers "$f")"
+                      [[ -f "$ref" ]] && jq -r '(.mcpServers // .) | objects | keys[]' "$ref" ;;
+            esac
+          fi
+        } 2>/dev/null | sed "s#^#plugin:$plugin:#"
+      done
+  return 0
+}
+
+# Links shared items from the default config, copies allowed MCP servers and links per-project memory.
+sync_shared() {  # alias
+  local a="$1" cfg item pj slug tmp
+  cfg="$(pdir "$a")/config"; pj="$(pjson "$a")"
+  mkdir -p "$cfg/projects"
+  for item in $SHARED_ITEMS; do
+    [[ -e "$BASE/$item" ]] || continue
+    if [[ -e "$cfg/$item" && ! -L "$cfg/$item" ]]; then echo "warning: $cfg/$item is a real file; not replacing it" >&2; continue; fi
+    ln -sfn "$BASE/$item" "$cfg/$item"
+  done
+  for item in $PRIVATE_ITEMS; do
+    # Replace a link to the shared folder (left by older versions) with the profile's own folder.
+    [[ -L "$cfg/$item" && "$(readlink "$cfg/$item")" == "$BASE/$item" ]] && rm "$cfg/$item"
+    mkdir -p "$cfg/$item"
+  done
+  jq -r '(.expanded // .dirs)[]' "$pj" | while IFS= read -r d; do
+    slug="${d//[^A-Za-z0-9]/-}"
+    mkdir -p "$BASE/projects/$slug/memory" "$cfg/projects/$slug"
+    [[ -e "$cfg/projects/$slug/memory" && ! -L "$cfg/projects/$slug/memory" ]] && continue
+    ln -sfn "$BASE/projects/$slug/memory" "$cfg/projects/$slug/memory"
+  done
+  if [[ -f "$HOME/.claude.json" ]]; then
+    local src="$HOME/.claude.json" dst="$cfg/.claude.json"
+    [[ -f "$dst" ]] || echo '{}' > "$dst"
+    tmp="$(mktemp)"
+    jq --slurpfile src "$src" --slurpfile pj "$pj" '
+        ($pj[0].expanded // $pj[0].dirs) as $dirs
+      | ($pj[0].mcp // []) as $allow
+      | .mcpServers = ($src[0].mcpServers // {} | with_entries(select(.key as $k | $allow | index($k))))
+      | .theme = (.theme // $src[0].theme)
+      | .hasCompletedOnboarding = true
+      | reduce ($src[0].projects // {} | to_entries[] | select(.key as $k | $dirs | index($k))) as $e (.;
+          .projects[$e.key] = ((.projects[$e.key] // {})
+            + ($e.value | {mcpServers: (.mcpServers // {}), enabledMcpjsonServers: (.enabledMcpjsonServers // []), disabledMcpjsonServers: (.disabledMcpjsonServers // [])})))
+    ' "$dst" > "$tmp" && mv "$tmp" "$dst"
+    chmod 600 "$dst"
+  fi
+}
+
+write_settings() {  # alias
+  local a="$1" pj cfg org dirs blocked base local_over
+  pj="$(pjson "$a")"; cfg="$(pdir "$a")/config"
+  org="$(jq -r '.orgId // empty' "$pj")"
+  # Working directories: the profile's repos and worktrees, shared skills and plugins, the profile's
+  # own memory folders, and the memory folders of its repos at both the link and the ~/.claude target.
+  dirs="$(jq -c --arg b "$BASE" --arg cfg "$cfg" '
+      (.expanded // .dirs) as $d
+    | ($d | map(gsub("[^A-Za-z0-9]"; "-"))) as $slugs
+    | $d + [$b + "/skills", $b + "/plugins", $cfg + "/memory", $cfg + "/agent-memory"]
+      + [$slugs[] | ($cfg + "/projects/" + . + "/memory"), ($b + "/projects/" + . + "/memory")]' "$pj")"
+  blocked="$(blocked_paths "$a" | jq -R . | jq -s .)"
+  local denied_mcp
+  denied_mcp="$(known_mcp | sort -u | jq -R . | jq -s --slurpfile pj "$pj" '[.[] | select(. as $n | ($pj[0].mcp // []) | index($n) | not)]')"
+  mkdir -p "$cfg"
+  base='{}'; [[ -f "$BASE/settings.json" ]] && base="$(cat "$BASE/settings.json")"
+  local_over='{}'; [[ -f "$(pdir "$a")/settings.override.json" ]] && local_over="$(cat "$(pdir "$a")/settings.override.json")"
+  # Order: default settings, then the profile's override file, then the isolation keys, which always win.
+  jq -n --argjson base "$base" --argjson over "$local_over" --arg org "$org" --argjson dirs "$dirs" --argjson b "$blocked" --argjson dm "$denied_mcp" '
+      def rules($ps): [$ps[] | "Read(/\(.)/**)", "Edit(/\(.)/**)"];
+      ($base * $over)
+    | .forceLoginMethod = "claudeai"
+    | (if $org != "" then .forceLoginOrgUUID = $org else del(.forceLoginOrgUUID) end)
+    | .permissions.additionalDirectories = $dirs
+    | .permissions.blockReadsOutsideWorkingDirectories = true
+    | .permissions.deny = ((.permissions.deny // []) + rules($b) | unique)
+    | .sandbox.enabled = true
+    | .sandbox.failIfUnavailable = true
+    | .sandbox.allowUnsandboxedCommands = false
+    | .sandbox.filesystem.denyRead = ((.sandbox.filesystem.denyRead // []) + $b | unique)
+    | .sandbox.filesystem.denyWrite = ((.sandbox.filesystem.denyWrite // []) + $b | unique)
+    | .deniedMcpServers = ((.deniedMcpServers // []) + [$dm[] | {serverName: .}] | unique)
+  ' > "$cfg/settings.json.tmp"
+  mv "$cfg/settings.json.tmp" "$cfg/settings.json"
+  jq --argjson b "$blocked" '.managedBlocked = $b' "$pj" > "$pj.tmp" && mv "$pj.tmp" "$pj"
+  sync_shared "$a"
+  warn_ancestors "$a"
+}
+
+# A profile's directories plus every live git worktree of any repo among them.
+refresh_expanded() {  # alias
+  local a="$1" pj d wt
+  pj="$(pjson "$a")"
+  { jq -r '.dirs[]' "$pj"
+    jq -r '.dirs[]' "$pj" | while IFS= read -r d; do
+      git -C "$d" rev-parse --git-dir >/dev/null 2>&1 || continue
+      git -C "$d" worktree list --porcelain | awk '/^worktree /{p=substr($0,10)} /^prunable/{p=""} /^$/{if(p!="")print p; p=""} END{if(p!="")print p}' \
+        | while IFS= read -r wt; do [[ -d "$wt" ]] && (cd "$wt" && pwd -P); done
+    done
+  } | jq -R . | jq -s 'unique' > "$pj.exp"
+  jq --slurpfile e "$pj.exp" '.expanded = $e[0]' "$pj" > "$pj.tmp" && mv "$pj.tmp" "$pj"; rm -f "$pj.exp"
+}
+
+# Inputs that change generated settings: profile dirs and orgs, live worktrees, default settings, MCP servers.
+fingerprint() {
+  local a d
+  for a in $(aliases); do
+    jq -c '{alias, dirs, orgId, mcp}' "$(pjson "$a")"
+    jq -r '.dirs[]' "$(pjson "$a")" | while IFS= read -r d; do git -C "$d" worktree list --porcelain 2>/dev/null | grep -E '^(worktree|prunable)'; done
+  done
+  cat "$BASE/settings.json" 2>/dev/null
+  [[ -f "$HOME/.claude.json" ]] && jq -c '[.mcpServers, (.projects // {} | map_values(.mcpServers))]' "$HOME/.claude.json"
+  ls -1 "$BASE" 2>/dev/null
+  cat "$BASE/plugins/installed_plugins.json" 2>/dev/null
+  cat "$0"
+}
+
+hash_stdin() { if command -v shasum >/dev/null; then shasum | cut -c1-40; else sha1sum | cut -c1-40; fi; }
+
+refresh_if_stale() {
+  local fp; fp="$(fingerprint | hash_stdin)"
+  [[ -f "$ROOT/.fingerprint" && "$(cat "$ROOT/.fingerprint")" == "$fp" ]] && return 0
+  write_all 2>/dev/null
+  echo "$fp" > "$ROOT/.fingerprint"
+}
+
+write_all() { local o; for o in $(aliases); do refresh_expanded "$o"; done; for o in $(aliases); do write_settings "$o"; done; }
+
+do_login() {  # alias
+  local a="$1" pj cfg email status got org
+  pj="$(pjson "$a")"; cfg="$(pdir "$a")/config"
+  email="$(jq -r .email "$pj")"
+  echo "Opening browser${email:+ for $email}. Sign in with that account (for a Google account, choose \"Continue with Google\")."
+  CLAUDE_CONFIG_DIR="$cfg" "$CLAUDE_BIN" auth login --claudeai ${email:+--email "$email"}
+  status="$(CLAUDE_CONFIG_DIR="$cfg" "$CLAUDE_BIN" auth status --json)"
+  [[ "$(jq -r .loggedIn <<<"$status")" == "true" ]] || die "login did not complete"
+  got="$(jq -r '.email // .emailAddress // empty' <<<"$status")"
+  org="$(jq -r '.orgId // empty' <<<"$status")"
+  if [[ -n "$got" && -n "$email" && "$(tr '[:upper:]' '[:lower:]' <<<"$got")" != "$(tr '[:upper:]' '[:lower:]' <<<"$email")" ]]; then
+    echo "warning: signed in as $got, expected $email" >&2
+  fi
+  jq --arg got "$got" --arg org "$org" --arg on "$(jq -r '.orgName // empty' <<<"$status")" '.orgId = $org | .orgName = $on | (if (.email // "") == "" then .email = $got else . end)' "$pj" > "$pj.tmp" && mv "$pj.tmp" "$pj"
+  write_settings "$a"
+  echo "Profile $a: org $(jq -r '.orgName // "?"' "$pj") ($org), plan $(jq -r '.subscriptionType // "?"' <<<"$status")"
+}
+
+cmd_add() {
+  local client="" a="" email="" login=1 dirs=() mcp=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --client) client="$2"; shift 2 ;;
+      --alias) a="$2"; shift 2 ;;
+      --email) email="$2"; shift 2 ;;
+      --dir) dirs+=("$(abspath "$2")"); shift 2 ;;
+      --mcp) mcp+=("$2"); shift 2 ;;
+      --no-login) login=0; shift ;;
+      *) die "unknown option: $1" ;;
+    esac
+  done
+  [[ -t 0 && -z "$client" ]] && read -rp "Client name: " client
+  [[ -t 0 && -z "$a" ]] && read -rp "Profile alias: " a
+  [[ -t 0 && -z "$email" ]] && read -rp "Google account email (optional): " email
+  if [[ -t 0 && ${#dirs[@]} -eq 0 ]]; then
+    local d
+    while read -rp "Directory (blank to finish): " d && [[ -n "$d" ]]; do dirs+=("$(abspath "${d/#\~/$HOME}")"); done
+  fi
+  [[ -n "$client" && -n "$a" && ${#dirs[@]} -gt 0 ]] || { usage; die "client, alias and at least one dir are required"; }
+  [[ "$a" =~ ^[A-Za-z0-9._-]+$ ]] || die "alias may contain only letters, digits, . _ -"
+  exists "$a" && die "profile $a already exists"
+  mkdir -p "$(pdir "$a")/config"
+  local mcp_json='[]'
+  [[ ${#mcp[@]} -gt 0 ]] && mcp_json="$(printf '%s\n' "${mcp[@]}" | jq -R . | jq -s 'unique')"
+  printf '%s\n' "${dirs[@]}" | jq -R . | jq -s --arg c "$client" --arg a "$a" --arg e "$email" --argjson m "$mcp_json" \
+    '{client:$c, alias:$a, email:$e, dirs:(.|unique), mcp:$m}' > "$(pjson "$a")"
+  write_all
+  echo "Created profile $a for $client at $(pdir "$a")"
+  if [[ $login -eq 1 ]]; then do_login "$a"; else echo "Skipped login; run: claude-profile login $a"; fi
+}
+
+matches_for_cwd() {  # prints aliases whose dirs contain $PWD
+  local cwd a; cwd="$(pwd -P)"
+  for a in $(aliases); do
+    jq -e --arg cwd "$cwd" '[(.expanded // .dirs)[] as $d | ($cwd == $d or ($cwd | startswith($d + "/")))] | any' "$(pjson "$a")" >/dev/null && echo "$a"
+  done
+  return 0
+}
+
+cmd_run() {
+  local a=""
+  refresh_if_stale
+  if [[ $# -gt 0 && "$1" != "--" ]]; then a="$1"; shift; fi
+  [[ "${1:-}" == "--" ]] && shift
+  if [[ -z "$a" ]]; then
+    local m=() line
+    while IFS= read -r line; do [[ -n "$line" ]] && m+=("$line"); done < <(matches_for_cwd)
+    case ${#m[@]} in
+      0) die "no profile covers $(pwd -P); pass an alias or add-dir" ;;
+      1) a="${m[0]}" ;;
+      *)
+        [[ -t 0 ]] || die "several profiles cover this directory (${m[*]}); pass an alias"
+        echo "Profiles for this directory:" >&2
+        PS3="Choose profile: "
+        select a in "${m[@]}"; do [[ -n "$a" ]] && break; done
+        [[ -n "$a" ]] || die "no profile chosen" ;;
+    esac
+  fi
+  exists "$a" || die "no profile named $a"
+  local cwd; cwd="$(pwd -P)"
+  jq -e --arg cwd "$cwd" '[(.expanded // .dirs)[] as $d | ($cwd == $d or ($cwd | startswith($d + "/")))] | any' "$(pjson "$a")" >/dev/null \
+    || die "$cwd is outside profile $a's directories; cd into one or run: claude-profile add-dir $a <path>"
+  echo "Using profile $a ($(jq -r '.client + ", " + (if (.email // "") == "" then "not logged in" else .email end)' "$(pjson "$a")"))" >&2
+  # --settings applies the profile file again above project settings, so a repo's .claude/settings.json cannot relax it.
+  CLAUDE_CONFIG_DIR="$(pdir "$a")/config" exec "$CLAUDE_BIN" --settings "$(pdir "$a")/config/settings.json" "$@"
+}
+
+cmd_list() {
+  local a
+  printf '%-16s %-16s %-30s %-8s %s\n' ALIAS CLIENT EMAIL ORG DIRS
+  for a in $(aliases); do
+    jq -r '[.alias, .client, .email, (if .orgId then "locked" else "-" end), (.dirs|join(", "))] | @tsv' "$(pjson "$a")" \
+      | awk -F'\t' '{printf "%-16s %-16s %-30s %-8s %s\n", $1, $2, $3, $4, $5}'
+  done
+}
+
+cmd_mcp() {  # ALIAS [allow|deny NAME...]
+  local a="${1:-}" action="${2:-}" pj
+  [[ -n "$a" ]] || die "usage: mcp ALIAS [allow|deny NAME...]"
+  exists "$a" || die "no profile named $a"
+  pj="$(pjson "$a")"
+  if [[ -z "$action" ]]; then
+    known_mcp | sort -u | while IFS= read -r n; do
+      if jq -e --arg n "$n" '(.mcp // []) | index($n)' "$pj" >/dev/null; then echo "allowed  $n"; else echo "blocked  $n"; fi
+    done
+    return 0
+  fi
+  shift 2
+  [[ $# -gt 0 ]] || die "usage: mcp ALIAS $action NAME..."
+  local names; names="$(printf '%s\n' "$@" | jq -R . | jq -s .)"
+  case "$action" in
+    allow) jq --argjson n "$names" '.mcp = ((.mcp // []) + $n | unique)' "$pj" > "$pj.tmp" ;;
+    deny)  jq --argjson n "$names" '.mcp = ((.mcp // []) - $n)' "$pj" > "$pj.tmp" ;;
+    *) die "usage: mcp ALIAS [allow|deny NAME...]" ;;
+  esac
+  mv "$pj.tmp" "$pj"
+  write_all
+  echo "$a MCP servers allowed: $(jq -r '(.mcp // []) | if length == 0 then "none" else join(", ") end' "$pj")"
+}
+
+cmd_add_dir() {
+  local a="$1" d; d="$(abspath "$2")"
+  exists "$a" || die "no profile named $a"
+  jq --arg d "$d" '.dirs = ((.dirs + [$d]) | unique)' "$(pjson "$a")" > "$(pjson "$a").tmp" && mv "$(pjson "$a").tmp" "$(pjson "$a")"
+  write_all; echo "Added $d to $a"
+}
+
+cmd_remove() {
+  local a="$1" dest
+  exists "$a" || die "no profile named $a"
+  CLAUDE_CONFIG_DIR="$(pdir "$a")/config" "$CLAUDE_BIN" auth logout || echo "warning: logout failed; Keychain entry may remain" >&2
+  dest="$ROOT/.removed/$a-$(date +%Y%m%d%H%M%S)"
+  mkdir -p "$ROOT/.removed"; mv "$(pdir "$a")" "$dest"
+  write_all
+  echo "Logged out $a; profile files kept at $dest"
+}
+
+cmd_shell_init() {
+  local a
+  cat <<'EOF'
+unalias ccp 2>/dev/null
+ccp() {
+  case "${1:-}" in
+    add|login|run|match|list|mcp|add-dir|remove|shell-init|version|help|-h|--help) claude-profile "$@" ;;
+    *) claude-profile run "$@" ;;
+  esac
+}
+# claude uses the profile covering $PWD; elsewhere, inside a profile session, or with CLAUDE_PROFILE=none it is plain claude.
+claude() {
+  if [[ -z "${CLAUDE_CONFIG_DIR:-}" && "${CLAUDE_PROFILE:-}" != none ]] && claude-profile match >/dev/null 2>&1; then
+    claude-profile run -- "$@"
+  else
+    command claude "$@"
+  fi
+}
+EOF
+  for a in $(aliases); do echo "alias claude-$a='claude-profile run $a'"; done
+}
+
+need jq
+case "${1:-}" in
+  add) shift; cmd_add "$@" ;;
+  login) [[ $# -eq 2 ]] || die "usage: login ALIAS"; exists "$2" || die "no profile named $2"; do_login "$2" ;;
+  run) shift; cmd_run "$@" ;;
+  match) [[ -d "$ROOT" ]] || exit 1; refresh_if_stale; found="$(matches_for_cwd)"; [[ -n "$found" ]] && echo "$found" ;;
+  version|--version|-V) echo "claude-profile $VERSION" ;;
+  list) cmd_list ;;
+  mcp) shift; cmd_mcp "$@" ;;
+  add-dir) [[ $# -eq 3 ]] || die "usage: add-dir ALIAS PATH"; cmd_add_dir "$2" "$3" ;;
+  remove) [[ $# -eq 2 ]] || die "usage: remove ALIAS"; cmd_remove "$2" ;;
+  shell-init) cmd_shell_init ;;
+  ""|-h|--help|help) usage ;;
+  *) usage; exit 1 ;;
+esac
